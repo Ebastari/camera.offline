@@ -88,6 +88,7 @@ export const CameraView: React.FC<CameraViewProps> = ({
   const [needsUserAction, setNeedsUserAction] = useState(false);
   const [showPlantTypePicker, setShowPlantTypePicker] = useState(false);
   const [showPanel, setShowPanel] = useState(false);
+  const [localMode, setLocalMode] = useState<'offline' | 'fast' | 'lite'>('offline');
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -109,19 +110,18 @@ export const CameraView: React.FC<CameraViewProps> = ({
     setCameraLoading(true);
     setCameraError(null);
     setNeedsUserAction(false);
-    stopCurrentStream();
+
+    // Stop existing stream first
+    if (videoRef.current && videoRef.current.srcObject) {
+      const stream = videoRef.current.srcObject as MediaStream;
+      stream.getTracks().forEach(track => track.stop());
+      videoRef.current.srcObject = null;
+    }
 
     try {
       const stream = await startCamera(deviceId);
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        if (videoRef.current.readyState < 2) {
-          await new Promise<void>((resolve) => {
-            const onReady = () => { videoRef.current?.removeEventListener('loadedmetadata', onReady); resolve(); };
-            videoRef.current?.addEventListener('loadedmetadata', onReady);
-            setTimeout(() => { videoRef.current?.removeEventListener('loadedmetadata', onReady); resolve(); }, 5000);
-          });
-        }
         try {
           await videoRef.current.play();
           setCameraLoading(false);
@@ -139,12 +139,36 @@ export const CameraView: React.FC<CameraViewProps> = ({
       setCameraError(err.name === 'NotAllowedError' ? 'Izin kamera ditolak' : 'Gagal memuat kamera');
       setCameraLoading(false);
     }
-  }, [stopCurrentStream]);
+  }, []);
 
+  // Startup: initialize camera once
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const videoDevices = await getCameraDevices();
+        if (cancelled) return;
+        setDevices(videoDevices);
+        const backCamera = videoDevices.find(d => /back|rear|environment/i.test(d.label));
+        await initializeCamera(backCamera?.deviceId || videoDevices[0]?.deviceId);
+      } catch {
+        if (!cancelled) {
+          setCameraError('Perangkat tidak didukung');
+          setCameraLoading(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      stopCurrentStream();
+    };
+  }, []);
+
+  // Re-init on visibility change
   useEffect(() => {
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
-        if (cameraLoading || !videoRef.current?.srcObject) {
+        if (!videoRef.current?.srcObject) {
           getCameraDevices().then(videoDevices => {
             setDevices(videoDevices);
             const backCamera = videoDevices.find(d => /back|rear|environment/i.test(d.label));
@@ -157,23 +181,7 @@ export const CameraView: React.FC<CameraViewProps> = ({
     };
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, [cameraLoading, stopCurrentStream, initializeCamera]);
-
-  useEffect(() => {
-    const startup = async () => {
-      try {
-        const videoDevices = await getCameraDevices();
-        setDevices(videoDevices);
-        const backCamera = videoDevices.find(d => /back|rear|environment/i.test(d.label));
-        await initializeCamera(backCamera?.deviceId || videoDevices[0]?.deviceId);
-      } catch {
-        setCameraError('Perangkat tidak didukung');
-        setCameraLoading(false);
-      }
-    };
-    startup();
-    return () => stopCurrentStream();
-  }, [initializeCamera, stopCurrentStream]);
+  }, []);
 
   useEffect(() => {
     if (!cameraLoading) return;
@@ -188,6 +196,22 @@ export const CameraView: React.FC<CameraViewProps> = ({
   }, [cameraLoading]);
 
   const handleRetryPlay = async () => {
+    // If there's no stream, re-initialize camera fully
+    if (!videoRef.current?.srcObject || cameraError) {
+      setCameraError(null);
+      setCameraLoading(true);
+      try {
+        const videoDevices = await getCameraDevices();
+        setDevices(videoDevices);
+        const backCamera = videoDevices.find(d => /back|rear|environment/i.test(d.label));
+        await initializeCamera(backCamera?.deviceId || videoDevices[0]?.deviceId);
+      } catch {
+        setCameraError('Gagal memuat kamera. Coba lagi.');
+        setCameraLoading(false);
+      }
+      return;
+    }
+    // If stream exists but paused, just play
     if (videoRef.current) {
       try { await videoRef.current.play(); setNeedsUserAction(false); } catch { showToast('Gagal memulai video.', 'error'); }
     }
@@ -440,11 +464,42 @@ export const CameraView: React.FC<CameraViewProps> = ({
               </span>
             </div>
 
-            {/* Mode Offline Badge */}
-            <div className="backdrop-blur-sm px-2 py-1 rounded-lg border bg-amber-500/10 border-amber-400/20 flex items-center gap-1.5">
-              <div className="w-1.5 h-1.5 rounded-full bg-amber-400 shadow-[0_0_4px_rgba(251,191,36,0.6)]" />
-              <span className="text-[7px] font-black text-amber-300 uppercase tracking-widest">Mode Offline</span>
-            </div>
+            {/* Mode Toggle: Offline → Fast → Lite → (redirect back) */}
+            <button
+              type="button"
+              onClick={() => {
+                const current = localMode;
+                if (current === 'offline') {
+                  setLocalMode('fast');
+                } else if (current === 'fast') {
+                  setLocalMode('lite');
+                } else {
+                  // lite → buka link fast/lite dan reset
+                  window.open('https://camera.montana-tech.info/', '_blank');
+                  setLocalMode('offline');
+                }
+              }}
+              className={`backdrop-blur-sm px-2 py-1 rounded-lg border flex items-center gap-1.5 active:scale-95 transition-all ${
+                localMode === 'offline'
+                  ? 'bg-orange-500/10 border-orange-400/20'
+                  : localMode === 'fast'
+                    ? 'bg-sky-500/10 border-sky-400/20'
+                    : 'bg-amber-500/10 border-amber-400/20'
+              }`}
+            >
+              <div className={`w-1.5 h-1.5 rounded-full ${
+                localMode === 'offline' ? 'bg-orange-400 shadow-[0_0_4px_rgba(251,146,60,0.6)]'
+                  : localMode === 'fast' ? 'bg-sky-300'
+                  : 'bg-amber-300'
+              }`} />
+              <span className={`text-[7px] font-black uppercase tracking-widest ${
+                localMode === 'offline' ? 'text-orange-200'
+                  : localMode === 'fast' ? 'text-sky-100'
+                  : 'text-amber-200'
+              }`}>
+                {localMode === 'offline' ? 'Offline' : localMode === 'fast' ? 'Sync Fast' : 'Sync Lite'}
+              </span>
+            </button>
           </div>
         </div>
       </div>
